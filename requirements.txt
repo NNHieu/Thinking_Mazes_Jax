@@ -1,0 +1,4 @@
+hydra-core==1.1.1
+chess==1.6.1
+easy-to-hard-data==1.0.0
+equinox==0.5.0
