@@ -9,15 +9,70 @@
 
 import os
 from typing import Callable, Optional
-import torch
-from torch.utils import data
-from easy_to_hard_data import download_url, extract_zip
 from jax import numpy as jnp
+import jax
 import numpy as np
-from torch.utils import data
-from torchvision.datasets import MNIST
 
-class MazeDataset(torch.utils.data.Dataset):
+import errno
+import os
+import os.path
+import tarfile
+import urllib.request as ur
+from typing import Optional, Callable
+
+import numpy as np
+from tqdm import tqdm
+
+GBFACTOR = float(1 << 30)
+
+def extract_zip(path, folder):
+    file = tarfile.open(path)
+    file.extractall(folder)
+    file.close
+
+def makedirs(path):
+    try:
+        os.makedirs(os.path.expanduser(os.path.normpath(path)))
+    except OSError as e:
+        if e.errno != errno.EEXIST and os.path.isdir(path):
+            raise e
+
+def download_url(url, folder):
+    filename = url.rpartition('/')[2]
+    path = os.path.join(folder, filename)
+
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        print('Using existing file', filename)
+        return path
+    print('Downloading', url)
+    makedirs(folder)
+    # track downloads
+    ur.urlopen(f"http://avi.koplon.com/hit_counter.py?next={url}")
+    data = ur.urlopen(url)
+    size = int(data.info()["Content-Length"])
+    chunk_size = 1024*1024
+    num_iter = int(size/chunk_size) + 2
+
+    downloaded_size = 0
+
+    try:
+        with open(path, 'wb') as f:
+            pbar = tqdm(range(num_iter))
+            for i in pbar:
+                chunk = data.read(chunk_size)
+                downloaded_size += len(chunk)
+                pbar.set_description("Downloaded {:.2f} GB".format(float(downloaded_size)/GBFACTOR))
+                f.write(chunk)
+    except:
+        if os.path.exists(path):
+             os.remove(path)
+        raise RuntimeError('Stopped downloading due to interruption.')
+
+    return path
+
+
+
+class MazeDataset(object):
     """This is a dataset class for mazes.
     padding and cropping is done correctly within this class for small and large mazes.
     """
@@ -53,15 +108,14 @@ class MazeDataset(torch.utils.data.Dataset):
         self.inputs = inputs_np.astype(np.float32)
         self.targets = targets_np.astype(np.int32)
 
-
     def __getitem__(self, index):
         img, target = self.inputs[index], self.targets[index]
 
-        if self.transform is not None:
-            stacked = torch.cat([img, target.unsqueeze(0)], dim=0)
-            stacked = self.transform(stacked)
-            img = stacked[:3].float()
-            target = stacked[3].long()
+        # if self.transform is not None:
+        #     stacked = torch.cat([img, target.unsqueeze(0)], dim=0)
+        #     stacked = self.transform(stacked)
+        #     img = stacked[:3].float()
+        #     target = stacked[3].long()
 
         return img, target
 
@@ -83,73 +137,50 @@ class MazeDataset(torch.utils.data.Dataset):
         extract_zip(path, self.root)
         os.unlink(path)
 
-def numpy_collate(batch):
-  if isinstance(batch[0], np.ndarray):
-    return jnp.stack(batch)
-  elif isinstance(batch[0], (tuple,list)):
-    transposed = zip(*batch)
-    return [numpy_collate(samples) for samples in transposed]
-  else:
-    return jnp.array(batch)
-
-class NumpyLoader(data.DataLoader):
-  def __init__(self, dataset, batch_size=1,
-                shuffle=False, sampler=None,
-                batch_sampler=None, num_workers=0,
-                pin_memory=False, drop_last=False,
-                timeout=0, worker_init_fn=None):
-    super(self.__class__, self).__init__(dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        sampler=sampler,
-        batch_sampler=batch_sampler,
-        num_workers=num_workers,
-        collate_fn=numpy_collate,
-        pin_memory=pin_memory,
-        drop_last=drop_last,
-        timeout=timeout,
-        worker_init_fn=worker_init_fn)
-
-class FlattenAndCast(object):
-  def __call__(self, pic):
-    return jnp.ravel(jnp.array(pic, dtype=jnp.float32))
-
-# Ignore statemenst for pylint:
-#     Too many branches (R0912), Too many statements (R0915), No member (E1101),
-#     Not callable (E1102), Invalid name (C0103), No exception (W0702),
-#     Too many local variables (R0914), Missing docstring (C0116, C0115),
-#     Unused import (W0611).
-# pylint: disable=R0912, R0915, E1101, E1102, C0103, W0702, R0914, C0116, C0115, W0611
-
-
-def prepare_maze_loader(root, train_batch_size, test_batch_size, train_data, test_data, shuffle=True):
-
+def prepare_maze_loader(root, train_data, test_data):
     train_data = MazeDataset(root, train=True, size=train_data, download=True)
-    testset = MazeDataset(root, train=False, size=test_data, download=True)
-
+    test_data = MazeDataset(root, train=False, size=test_data, download=True)
+    indices = np.random.permutation(train_data.inputs.shape[0])
     train_split = int(0.8 * len(train_data))
+    training_idx, val_idx = indices[:train_split], indices[train_split:]
+    trainset = (train_data.inputs[training_idx, :], train_data.targets[training_idx, :])
+    valset = (train_data.inputs[val_idx, :], train_data.targets[val_idx, :])
+    testset = (test_data.inputs, test_data.targets)
+    return {"train": trainset, "val": valset, "testset": testset}
 
-    trainset, valset = torch.utils.data.random_split(train_data,
-                                                     [train_split,
-                                                      int(len(train_data) - train_split)],
-                                                     generator=torch.Generator().manual_seed(42))
+class DataLoader(object):
+  def __init__(self, ds, batch_size) -> None:
+    self.__ds = ds
+    self.batch_size = batch_size
+    self.__perms = None
+  
+  @property
+  def batch_size(self):
+    return self.__batch_size
+  
+  @batch_size.setter
+  def batch_size(self, value):
+    self.__batch_size = value
+    self.__train_ds_size = len(self.__ds[0])
+    self.__steps_per_epoch = self.__train_ds_size // self.__batch_size
 
-    trainloader = NumpyLoader(trainset,
-                            num_workers=0,
-                            batch_size=train_batch_size,
-                            shuffle=shuffle,
-                            drop_last=True)
-    valloader = NumpyLoader(valset,
-                            num_workers=0,
-                            batch_size=test_batch_size,
-                            shuffle=False,
-                            drop_last=False)
-    testloader = NumpyLoader(testset,
-                            num_workers=0,
-                            batch_size=test_batch_size,
-                            shuffle=False,
-                            drop_last=False)
+  def new_perms(self, rng):
+    self.__perms = jax.random.permutation(rng, self.__train_ds_size)
+    self.__perms = self.__perms[:self.__steps_per_epoch * self.batch_size]  # skip incomplete batch
+    self.__perms = self.__perms.reshape((self.__steps_per_epoch, self.batch_size))
+  
+  def __iter__(self):
+    assert self.__perms is not None
+    self.__iter_idx = 0
+    return self
+  
+  def __next__(self):
+    if self.__iter_idx >= len(self.__perms):
+      raise StopIteration
+    else:
+      out =  [v[self.__perms[self.__iter_idx], ...] for v in self.__ds]
+      self.__iter_idx += 1
+      return out
 
-    loaders = {"train": trainloader, "test": testloader, "val": valloader}
-
-    return loaders
+  def __len__(self):
+    return self.__steps_per_epoch
